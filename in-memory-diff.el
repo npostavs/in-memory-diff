@@ -43,6 +43,8 @@
 
 ;;; Code:
 
+(eval-when-compile (require 'cl-lib))
+
 (defvar in-memory-this nil
   "This source buffer")
 
@@ -143,6 +145,47 @@ temporary files to disk."
       (set (make-local-variable 'in-memory-this) buffer2)
       (set (make-local-variable 'in-memory-other) buffer1)
       (display-buffer (current-buffer) 'display-buffer-pop-up-window))))
+
+(defun in-memory-ediff (buffer1 buffer2)
+  "Show the difference between two buffers using ediff.
+
+We use mkfifo(1), cat(1), and `shell-file-name' to avoid writing
+the buffers to disk."
+  (interactive "bBuffer A: \nbBuffer B: ")
+  (require 'ediff)
+  (setq buffer1 (get-buffer buffer1))
+  (setq buffer2 (get-buffer buffer2))
+  (let* ((tmpdir (make-temp-file "tmp-fifos" t))
+         (fifo1 (expand-file-name "fifo1" tmpdir))
+         (fifo2 (expand-file-name "fifo2" tmpdir))
+         (process-connection-type nil)
+         (proc-fifo1 (start-process "cat to fifo1" nil shell-file-name shell-command-switch
+                                    (format "cat > %s" (shell-quote-argument fifo1))))
+         (proc-fifo2 (start-process "cat to fifo2" nil shell-file-name shell-command-switch
+                                    (format "cat > %s" (shell-quote-argument fifo2)))))
+    (unwind-protect
+        (progn
+          (call-process "mkfifo" nil nil nil fifo1 fifo2)
+          (cl-letf (((symbol-function 'ediff-make-diff2-buffer)
+                     (lambda (diff-buffer file1 file2)
+                       ;; Execute diff asynchronously, so we can write to fifos.
+                       (ediff-exec-process ediff-diff-program diff-buffer
+                                           nil ediff-actual-diff-options file1 file2)
+                       ;; TODO: break up the buffer strings into
+                       ;; parts, and interleave sending to avoid
+                       ;; deadlocks.
+                       (process-send-string proc-fifo1 (with-current-buffer buffer1 (buffer-string)))
+                       (process-send-eof proc-fifo1)
+                       (process-send-string proc-fifo2 (with-current-buffer buffer2 (buffer-string)))
+                       (process-send-eof proc-fifo2)
+                       (while (let ((diff-proc (get-buffer-process diff-buffer)))
+                                (and (processp diff-proc)
+                                     (eq (process-status diff-proc) 'run)))
+                         (accept-process-output (get-buffer-process diff-buffer)))
+                       (buffer-size diff-buffer))))
+            (ediff-setup buffer1 fifo1 buffer2 fifo2 nil nil nil
+                         '((ediff-job-name . compare-fifos)))))
+      (delete-directory tmpdir t))))
 
 (provide 'in-memory-diff)
 
